@@ -40,6 +40,7 @@ logger = logging.getLogger("tts_engine")
 
 try:
     from piper import PiperVoice
+    from piper.config import SynthesisConfig as PiperSynthesisConfig
 except ImportError as exc:  # pragma: no cover - guía de instalación en runtime
     raise ImportError(
         "No se encontró el paquete 'piper-tts'. Instálalo con: pip install piper-tts"
@@ -91,17 +92,30 @@ class VoiceParams:
         return SynthesisConfig(
             length_scale=length_scale,
             noise_scale=noise_scale,
-            noise_w=noise_w,
+            noise_w_scale=noise_w,
         )
 
 
 @dataclass
 class SynthesisConfig:
-    """Parámetros nativos que Piper/VITS espera en tiempo de inferencia."""
+    """Parámetros nativos que Piper/VITS espera en tiempo de inferencia.
+
+    Nota: el campo se llama `noise_w_scale` (no `noise_w`) para coincidir
+    exactamente con `piper.config.SynthesisConfig` de las versiones
+    recientes del paquete `piper-tts`.
+    """
 
     length_scale: float
     noise_scale: float
-    noise_w: float
+    noise_w_scale: float
+
+    def to_piper_config(self) -> PiperSynthesisConfig:
+        """Construye el SynthesisConfig nativo que espera PiperVoice.synthesize()."""
+        return PiperSynthesisConfig(
+            length_scale=self.length_scale,
+            noise_scale=self.noise_scale,
+            noise_w_scale=self.noise_w_scale,
+        )
 
 
 class TTSEngine:
@@ -170,25 +184,25 @@ class TTSEngine:
         """
         voice = self.get_voice(params.voice_id)
         config = params.to_synthesis_config()
+        piper_config = config.to_piper_config()
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
 
         def _produce() -> None:
             try:
-                # PiperVoice.synthesize_stream_raw entrega bytes PCM crudos
-                # (sin cabecera WAV) en bloques, según el modelo/versión de piper.
-                for raw_chunk in voice.synthesize_stream_raw(
-                    text,
-                    length_scale=config.length_scale,
-                    noise_scale=config.noise_scale,
-                    noise_w=config.noise_w,
-                ):
+                # PiperVoice.synthesize() entrega un AudioChunk por frase
+                # detectada internamente por Piper (no por bloques de
+                # tiempo fijo). Cada AudioChunk expone `.audio_int16_bytes`
+                # con el PCM S16LE ya listo para enviar. Re-fragmentamos ese
+                # bloque en trozos de `chunk_size_bytes` para no mandar un
+                # único frame gigante por el WebSocket.
+                for audio_chunk in voice.synthesize(text, syn_config=piper_config):
                     if cancel_flag.is_cancelled():
                         break
-                    # Re-fragmenta en bloques de tamaño uniforme para el envío.
-                    for i in range(0, len(raw_chunk), chunk_size_bytes):
-                        piece = raw_chunk[i : i + chunk_size_bytes]
+                    raw_bytes = audio_chunk.audio_int16_bytes
+                    for i in range(0, len(raw_bytes), chunk_size_bytes):
+                        piece = raw_bytes[i : i + chunk_size_bytes]
                         asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
                         if cancel_flag.is_cancelled():
                             break
