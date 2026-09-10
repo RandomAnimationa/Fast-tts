@@ -252,6 +252,3 @@ El servidor, al recibirlo:
 
 ---
 
-## Licencia
-
-MIT — usa, modifica y despliega libremente.
